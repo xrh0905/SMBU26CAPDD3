@@ -1,9 +1,10 @@
-"""扫描、列出、批量整理作业文件的小脚本。
+r"""扫描、列出、批量整理作业文件的小脚本。
 
 用法示例：
     python main.py .                                  # 列出当前文件夹的文件
     python main.py D:/homework -e docx -e pdf         # 只看 docx / pdf
     python main.py rename D:/homework                 # 预览改名，确认后才真的改
+    python main.py rename D:/homework --rule '^(?P<sid>\d+)_(?P<name>.+)$=>\g<name>_\g<sid>'
     python main.py archive D:/homework --by term      # 按学期归到子文件夹并生成报告
     python main.py undo D:/homework                   # 撤销上次归档
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,11 @@ COMMANDS = ("list", "rename", "archive", "undo")
 GROUPS = ("term", "category")
 JOURNAL_NAME = ".pdd03_last_archive.json"
 REPORT_PREFIX = "整理报告-"
+
+# 默认改名规则：「学号_姓名_作业名」-> 「作业名_学号」；作业名里可以再带下划线
+DEFAULT_RULES = [(r"(?P<id>[^_]+)_(?P<name>[^_]+)_(?P<homework>.+)", r"\g<homework>_\g<id>")]
+
+Rule = tuple[re.Pattern[str], str]  # (整段匹配的正则, 替换模板)
 
 
 def human_size(size: int) -> str:
@@ -77,39 +84,93 @@ def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def renamed_name(path: Path) -> str | None:
-    """「学号_姓名_作业名.ext」->「作业名_学号.ext」；不符合格式时返回 None。"""
-    parts = path.stem.split("_")
-    if len(parts) < 3 or not all(part.strip() for part in parts):
-        return None
-    student_id, homework = parts[0], "_".join(parts[2:])
-    return f"{homework}_{student_id}{path.suffix}"
+def compile_rule(pattern: str, replace: str) -> Rule:
+    """编译一条改名规则，顺便检查替换模板里引用的分组是否真的存在。"""
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"正则写错了：{pattern}（{exc}）") from exc
+
+    for name in re.findall(r"\\g<([^>]+)>", replace):
+        if name not in compiled.groupindex:
+            raise ValueError(f"替换模板里的 \\g<{name}> 在正则 {pattern} 里没有对应的分组")
+    for number in re.findall(r"\\(\d+)", replace):
+        if int(number) > compiled.groups:
+            raise ValueError(f"替换模板里的 \\{number} 超出了正则 {pattern} 的分组数量")
+    return compiled, replace
 
 
-def plan_renames(files: list[Path]) -> tuple[list[tuple[Path, Path, str]], list[tuple[Path, str]]]:
+def load_rules(cli_rules: list[str], rules_file: Path | None) -> tuple[list[Rule], list[str]]:
+    """按「命令行 --rule（在前）> 配置文件 > 内置默认」凑出规则表，返回 (规则, 配置里的扩展名)。"""
+    raw: list[tuple[str, str]] = []
+    exts: list[str] = []
+
+    if rules_file is not None:
+        try:
+            config = json.loads(rules_file.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"读不了配置文件 {rules_file}：{exc.strerror}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"配置文件 {rules_file} 不是合法 JSON：{exc}") from exc
+        if isinstance(config, list):
+            config = {"rules": config}
+        if not isinstance(config, dict):
+            raise ValueError(f"配置文件 {rules_file} 应该是一个对象，里面有 rules / ext")
+        for item in config.get("rules", []):
+            if not isinstance(item, dict) or "pattern" not in item or "replace" not in item:
+                raise ValueError(f'配置文件里的规则要写成 {{"pattern": "...", "replace": "..."}}：{item!r}')
+            raw.append((str(item["pattern"]), str(item["replace"])))
+        exts = [normalize_ext(str(e)) for e in config.get("ext", [])]
+
+    for spec in cli_rules:
+        if "=>" not in spec:
+            raise ValueError(f'规则要写成「正则=>替换模板」的形式，例如 "^(?P<sid>\\d+)_(?P<name>.+)$=>\\g<name>_\\g<sid>"：{spec}')
+        pattern, replace = spec.split("=>", 1)
+        raw.insert(0, (pattern, replace))  # 命令行规则优先
+
+    if not raw:
+        raw = DEFAULT_RULES
+    return [compile_rule(pattern, replace) for pattern, replace in raw], exts
+
+
+def apply_rules(stem: str, rules: list[Rule]) -> tuple[str, int] | None:
+    """拿文件名（不含扩展名）依次试规则（正则整段匹配），返回 (新名字, 命中的第几条) 或 None。"""
+    for index, (pattern, replace) in enumerate(rules, 1):
+        match = pattern.fullmatch(stem)
+        if match is not None:
+            return match.expand(replace).strip(), index
+    return None
+
+
+def plan_renames(files: list[Path], rules: list[Rule]) -> tuple[list[tuple[Path, Path, str]], list[tuple[Path, str]]]:
     """算出改名计划，返回 (计划, 跳过的文件及原因)；计划每项是 (原路径, 新路径, 备注)。"""
-    plans: list[tuple[Path, Path, str]] = []
+    plans: list[tuple[Path, Path, list[str]]] = []
     skipped: list[tuple[Path, str]] = []
     for path in files:
-        new_name = renamed_name(path)
-        if new_name is None:
-            skipped.append((path, "文件名不是「学号_姓名_作业名」"))
-        elif new_name == path.name:
+        result = apply_rules(path.stem, rules)
+        if result is None:
+            skipped.append((path, "没有规则匹配"))
+            continue
+        stem, index = result
+        if not stem or stem == path.stem:
             skipped.append((path, "新名字和原来一样"))
-        else:
-            plans.append((path, path.with_name(new_name), ""))
+            continue
+        notes = [f"第 {index}/{len(rules)} 条规则"] if len(rules) > 1 else []
+        plans.append((path, path.with_name(stem + path.suffix), notes))
 
     # 重名冲突：不能覆盖已有文件，也不能让两个文件改到同一个名字
     used = {file_key(f) for parent in {p.parent for p, _, _ in plans} for f in parent.iterdir() if f.is_file()}
     used -= {file_key(src) for src, _, _ in plans}  # 反正要改走的文件不占名字
     resolved: list[tuple[Path, Path, str]] = []
-    for src, dst, _ in plans:
+    for src, dst, notes in plans:
         candidate, index = dst, 1
         while file_key(candidate) in used:
             candidate = dst.with_name(f"{dst.stem}_{index}{dst.suffix}")
             index += 1
         used.add(file_key(candidate))
-        resolved.append((src, candidate, "重名，自动加了序号" if candidate != dst else ""))
+        if candidate != dst:
+            notes.append("重名，自动加了序号")
+        resolved.append((src, candidate, "；".join(notes)))
     return resolved, skipped
 
 
@@ -214,12 +275,19 @@ def run_list(args: argparse.Namespace) -> int:
 
 
 def run_rename(args: argparse.Namespace) -> int:
-    files = collect_files(args.folder, {normalize_ext(e) for e in args.ext})
+    try:
+        rules, config_exts = load_rules(args.rule, args.rules)
+    except ValueError as exc:
+        print(f"错误：{exc}")
+        return 2
+
+    exts = {normalize_ext(e) for e in args.ext} or set(config_exts)
+    files = collect_files(args.folder, exts)
     if not files:
         print("没有找到文件")
         return 1
 
-    plans, skipped = plan_renames(files)
+    plans, skipped = plan_renames(files, rules)
     if not plans:
         print("没有需要改名的文件")
         if skipped:
@@ -361,8 +429,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_target_args(list_parser)
     list_parser.set_defaults(func=run_list)
 
-    rename_parser = subparsers.add_parser("rename", help="按「作业名_学号.ext」批量改名，先预览再确认")
+    rename_parser = subparsers.add_parser("rename", help="按改名规则批量改名，先预览再确认")
     add_target_args(rename_parser)
+    rename_parser.add_argument(
+        "--rule",
+        action="append",
+        default=[],
+        metavar="正则=>替换模板",
+        help="自定义改名规则，可重复写，写在命令行最左边的先试；正则整段匹配文件名（不含扩展名），"
+        "替换模板里用 \\g<分组名> 引用，例如 --rule '(?P<sid>\\d+)_(?P<name>.+)$=>\\g<name>_\\g<sid>'",
+    )
+    rename_parser.add_argument(
+        "--rules",
+        type=Path,
+        metavar="文件",
+        help='从 JSON 配置文件读规则，格式：{"rules": [{"pattern": "...", "replace": "..."}], "ext": ["pdf"]}',
+    )
     rename_parser.add_argument("-y", "--yes", action="store_true", help="不询问，直接执行")
     rename_parser.set_defaults(func=run_rename)
 
